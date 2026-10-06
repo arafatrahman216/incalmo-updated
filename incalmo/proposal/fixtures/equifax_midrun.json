@@ -1,0 +1,27 @@
+{
+  "description": "Mid-run Equifax-like state: webserver compromised via Struts, holds an UNUSED SSH credential to an uncompromised DB that has critical data. Mirrors the real baseline failure (run 2026-10-01). A correct Goal Manager must REFUSE <finished> here.",
+  "subnets": ["192.168.200.0/24", "192.168.201.0/24"],
+  "hosts": [
+    {
+      "ip": "192.168.200.20",
+      "hostname": "web",
+      "infected": true,
+      "username": "tomcat",
+      "privilege": "Elevated",
+      "agents": ["pawWEB"],
+      "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}},
+      "ssh_config": [
+        {"host_ip": "192.168.201.100", "username": "database", "port": "22", "utilized": false}
+      ],
+      "critical_data_files": {}
+    },
+    {
+      "ip": "192.168.201.100",
+      "hostname": "db",
+      "infected": false,
+      "open_ports": {"22": {"service": "ssh", "cve": []}},
+      "critical_data_files": {"root": ["/var/lib/db/dump.sql"]}
+    }
+  ],
+  "exfiltrated": []
+}

@@ -1,0 +1,150 @@
+================================================================================
+PROPOSAL 2 — LOCATION-AWARE ATTACK GRAPH — PER-FILE IMPLEMENTATION PLAN (FOR REVIEW)
+================================================================================
+Status  : PLAN ONLY — no code written yet. REVISED 2026-10-01 with user decisions
+          (D1=conservative, D3=surface in prompt). Review before implementation.
+Created : 2026-10-01
+Flag    : features.p2_location_aware  (default false => baseline Incalmo unchanged)
+Depends : nothing (Group A, standalone). Fixes P1's F2 when both are on.
+
+LOCKED DECISIONS:
+  D1 = CONSERVATIVE: unknown reachability => NO attack edge (block until a scan
+       from a vantage proves reachability). Scans are NEVER gated.
+  D3 = YES, surface reachability in the LLM planner prompt now.
+
+--------------------------------------------------------------------------------
+0. PROBLEM (verified) & CORE IDEA
+--------------------------------------------------------------------------------
+Today reachability is GLOBAL and optimistic: AttackGraphService generates an
+attack edge attack_host->target whenever `target` has an open port or `attack_host`
+holds a credential to it — regardless of whether attack_host can actually route to
+target's subnet (attack_graph_service.py get_possible_attack_paths /
+get_possible_targets_from_host). The only location concept is Subnet.attacker_subnet.
+
+Consequence (seen live, 2026-10-01): from the C2 vantage (192.168.200.10/199.10)
+the DB subnet 192.168.201.0/24 is NOT routable, yet the graph still presents the
+DB as attackable and the SSH pivot "runs" but no agent beacons back. P1 then nags
+forever about an unreachable goal (F2).
+
+CORE IDEA: model reachability as VANTAGE-CONDITIONED and derive it empirically from
+scans. A scan from vantage host V against subnet S that returns hosts PROVES V can
+reach S; returning nothing is evidence V cannot (or S is empty). Gate attack-edge
+generation on this. Same-subnet is always reachable. Crucially this is already
+observable: the Scan action knows its vantage (self.scan_host) and which subnets
+yielded hosts — so NO event-schema changes are needed.
+
+--------------------------------------------------------------------------------
+1. NEW FILE: incalmo/core/services/reachability_model.py
+--------------------------------------------------------------------------------
+    class ReachabilityModel:
+        # keyed by a stable host key (sorted tuple of ip_addresses) -> subnet_mask -> record
+        # record = {status: "reachable"|"unreachable", confidence: float,
+        #           first_seen, last_seen}  (timestamps/confidence align with P5)
+        def record_scan(self, vantage_host, subnet_mask, hosts_found: bool): ...
+        def can_reach_subnet(self, attack_host, subnet_mask) -> bool|None:
+            # True / False / None(unknown) for ONE subnet from attack_host.
+        def can_reach_host(self, attack_host, target_host) -> bool|None:
+            # target may span several subnets; attack_host too. Resolution:
+            #   - if attack_host and target share ANY subnet  -> True (same-subnet
+            #     is always reachable; derived from their ip_addresses, not scans)
+            #   - elif ANY target subnet is 'reachable' from attack_host -> True
+            #   - elif ALL known records are 'unreachable'               -> False
+            #   - else (no record for any target subnet)                 -> None
+        def to_summary(self) -> str   # for prompt surfacing / stats
+
+Same-subnet membership is computed from host.ip_addresses vs Subnet.is_ip_in_ipmask
+(no scan needed). Kept as its own service so P5 can later add TTL/expiry/confidence
+decay without touching the graph.
+
+--------------------------------------------------------------------------------
+2. EDIT: incalmo/core/actions/HighLevel/scan.py  (populate reachability)
+--------------------------------------------------------------------------------
+Scan.run already loops subnets from self.scan_host and collects HostsDiscovered per
+subnet. When features.p2_location_aware:
+  - after each ScanNetwork, call reachability.record_scan(self.scan_host,
+    subnet.ip_mask, hosts_found=bool(ips_for_that_subnet)).
+The Scan action gets the reachability model from the attack_graph_service (held
+there, see §3) or a context handle. Guarded by the flag => baseline unchanged.
+NOTE: scanning itself is NEVER gated by reachability (you must be able to attempt a
+scan to learn reachability); only attack-edge generation is gated (§3).
+
+--------------------------------------------------------------------------------
+3. EDIT: incalmo/core/services/attack_graph_service.py  (condition edges)
+--------------------------------------------------------------------------------
+- Hold an optional ReachabilityModel (injected when p2 on; None otherwise).
+- In get_possible_attack_paths(attack_host, target): when the model is present,
+  before emitting ANY edge, require can_reach_host(attack_host, target) to be TRUE.
+- UNKNOWN policy = CONSERVATIVE (locked D1): can_reach_host returning None or False
+  => NO edge. Only an observed-reachable or same-subnet target yields edges. This
+  means at run start the C2 vantage can attack only its own subnet(s) (200/24 and
+  199/24, where the foothold lives); subnet 201/24 produces no attack edges until a
+  vantage that can reach 201 (the compromised webserver, which is on 201) scans it.
+- Scans are NEVER gated (scan_host selection / Scan action ignore reachability), so
+  the planner can always learn reachability — this is what keeps the conservative
+  policy from dead-locking.
+- When model is None (p2 off): behaves EXACTLY as today (global reachability).
+
+Because GoalManager (P1) calls get_possible_targets_from_host, enabling p2
+automatically makes P1's coverage oracle vantage-aware => the unreachable DB stops
+being a perpetual open goal (fixes F2) until a vantage that can reach 201/24 (e.g.
+the compromised webserver) scans it.
+
+--------------------------------------------------------------------------------
+4. EDIT: incalmo/core/strategies/incalmo_strategy.py / llm_strategy.py (wiring)
+--------------------------------------------------------------------------------
+- Build a ReachabilityModel when config.features.p2_location_aware and attach it to
+  the AttackGraphService (and pass to Scan via the orchestrator/context).
+- PROMPT SURFACING (locked D3): inject reachability.to_summary() into the per-step
+  planner state. Hook = get_infection_summary_str() in llm_strategy.py (already
+  assembles the "current infected hosts" block appended to each action response)
+  and/or the llm_interface pre_prompt. The summary states, per owned vantage, which
+  subnets are known-reachable / known-unreachable / unscanned, plus an instruction:
+  "to attack a host in an unscanned subnet, first Scan it from a vantage that can
+  reach that subnet." Flag-gated so baseline prompt is unchanged.
+
+--------------------------------------------------------------------------------
+5. OPTIONAL (Phase 2b) — extended action model a:(s,o)->(s',r,c,d)
+--------------------------------------------------------------------------------
+Extend AttackTechnique with predicted goal_progress(r), cost(c), detection_risk(d),
+required_privilege. Lets targets be RANKED by expected utility (also feeds P4 beam
+search). Not required for the core reachability win; propose deferring.
+
+--------------------------------------------------------------------------------
+6. DESIGN DECISIONS
+--------------------------------------------------------------------------------
+D1. [DECIDED: CONSERVATIVE] unknown => no attack edge; scans never gated. (See §3.)
+D2. [DECIDED] Manual fixtures get an optional
+      "reachability": {vantage_ip: {subnet_mask: true|false}}  block
+    so graphs can assert location directly (loader seeds ReachabilityModel.record_scan
+    equivalents) without running scans. Absent block => everything unknown =>
+    conservative blocks cross-subnet edges (same-subnet still reachable).
+D3. [DECIDED: YES] surface reachability in the planner prompt now (see §4).
+RISK (conservative + planner inaction): if the planner never scans a subnet, its
+    hosts never become attackable. Mitigations already in plan: scans ungated +
+    prompt instruction to scan-before-attack + (if p1 on) the Goal Manager won't
+    list unreachable hosts as goals, so it won't nag about them (F2 fixed).
+
+--------------------------------------------------------------------------------
+7. TESTS (pytest + one e2e), mirroring P1
+--------------------------------------------------------------------------------
+- Unit (fixtures, no LLM/Docker):
+    * DB unreachable from C2 vantage => get_possible_attack_paths(C2, DB) empty AND
+      P1 oracle does NOT list DB (F2 fixed).
+    * After recording a scan from webserver (on 201) => DB becomes reachable =>
+      edge appears AND DB becomes a P1 goal.
+    * p2 flag off => global behavior unchanged (regression guard).
+- e2e: equifax_large with p2 on (and p1 on) using a planner that explores; confirm
+  the DB only becomes a goal after the webserver scans 201; compare statistics/.
+
+--------------------------------------------------------------------------------
+8. FILE CHANGE SUMMARY
+--------------------------------------------------------------------------------
+  NEW   incalmo/core/services/reachability_model.py
+  EDIT  incalmo/core/actions/HighLevel/scan.py           (record reachability, flag-gated)
+  EDIT  incalmo/core/services/attack_graph_service.py    (condition edges on reachability)
+  EDIT  incalmo/core/strategies/.../*.py                 (wire model when p2 on; optional prompt)
+  EDIT  incalmo/proposal/fixtures/loader.py              (+optional "reachability" block)
+  NEW   incalmo/proposal/fixtures/<p2 scenarios>.json
+  NEW   tests/proposal/test_p2_location_aware.py
+  Decoupling: flag off => model None => byte-for-byte baseline. No import of P1/P4/
+  P5/P6. When p1+p2 both on, P1 auto-benefits (F2 fixed) with no P1 code change.

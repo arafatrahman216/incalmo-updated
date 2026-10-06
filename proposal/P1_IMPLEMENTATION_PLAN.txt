@@ -1,0 +1,229 @@
+================================================================================
+PROPOSAL 1 — GOAL-AND-PROGRESS MANAGER — PER-FILE IMPLEMENTATION PLAN (FOR REVIEW)
+================================================================================
+Status  : PLAN ONLY — no code written yet. Review before implementation.
+Created : 2026-10-01
+Flag    : features.p1_goal_manager  (default false => baseline Incalmo unchanged)
+Depends : nothing (Group A, standalone). Soft synergy with P2 (see §7).
+
+--------------------------------------------------------------------------------
+0. DESIGN DECISION — WHY A "COVERAGE ORACLE", NOT AN OMNISCIENT GOAL CHECK
+--------------------------------------------------------------------------------
+Verified: environment_initializer.py seeds ONLY the attacker's initial subnet
+knowledge (e.g. Equifax = one external subnet). There is NO ground-truth list of
+which hosts hold critical data — that is discovered at runtime via events
+(CriticalDataFound / ExfiltratedData) from the real victims. The attacker side
+therefore cannot know "all goals" a priori.
+
+=> P1's termination gate is a DETERMINISTIC COVERAGE ORACLE over CURRENT
+   attacker knowledge: refuse <finished> while any of these remain --
+     (a) an uninfected host reachable (per the attack graph) from some infected
+         host [there is still somewhere to go],
+     (b) a host with discovered critical_data_files NOT yet in
+         env.exfiltrated_data [known loot not taken],
+     (c) a held SSH credential whose target host is not yet compromised and
+         whose cred.utilized is False [an unused key to an unopened door].
+   Optional stricter mode: an explicit goal from config (e.g. compromise a host
+   role / exfiltrate from a named IP) for controlled fixture tests.
+
+The gate is deterministic (NOT LLM-mediated) because the LLM is the source of the
+early-stopping bug. <finished> becomes a REQUEST the oracle may veto.
+
+
+--------------------------------------------------------------------------------
+1. FILE: config/attacker_config.py   (add feature flags; backward compatible)
+--------------------------------------------------------------------------------
+ADD a pydantic model and an optional field on AttackerConfig:
+
+    class Features(BaseModel):
+        p1_goal_manager: bool = False
+        p2_location_aware: bool = False
+        p5_structured_memory: bool = False
+        p3_verifier: bool = False
+        p4_beam_search: bool = False
+        p6_dag_scheduler: bool = False
+        # P1 knobs:
+        p1_max_finish_rejections: int = 5   # safety valve (see §4)
+        p1_require_exfiltration: bool = True # treat known-but-untaken data as unmet
+
+    class AttackerConfig(BaseModel):
+        ... existing fields ...
+        features: Features = Field(default_factory=Features)
+
+WHY backward compatible: `features` defaults to an all-false Features(), so an
+existing config.json with no "features" key loads unchanged and behaves exactly
+like today. No change needed in config_service.py (it does AttackerConfig(**json)).
+
+config/config.json (user edits when they want P1 on):
+    "features": { "p1_goal_manager": true }
+
+
+--------------------------------------------------------------------------------
+2. NEW FILE: incalmo/core/services/goal_manager.py   (the oracle; pure logic)
+--------------------------------------------------------------------------------
+    class RemainingGoal:            # structured, for prompt + tests
+        kind: str                   # "compromise" | "exfiltrate" | "unused_cred"
+        detail: str                 # human string, e.g. "DB 192.168.201.100 reachable from webserver"
+        target_ip: str | None
+
+    class GoalManager:
+        def __init__(self, env_state_service, attack_graph_service, features):
+            ...
+        def remaining_goals(self) -> list[RemainingGoal]:
+            # (a) uninfected hosts reachable from any infected host:
+            #     for h in env.get_hosts_with_agents():
+            #        for path in attack_graph.get_possible_targets_from_host(h):
+            #           if not path.target_host.infected: add compromise goal
+            #     NOTE: get_possible_targets_from_host already encodes CURRENT
+            #     reachability (global now; P2 will make it vantage-aware ->
+            #     P1 auto-improves with no change here).
+            # (b) if features.p1_require_exfiltration:
+            #     for host with critical_data_files not all represented in
+            #     env.exfiltrated_data -> add exfiltrate goal
+            # (c) held creds: for host, for cred in host.ssh_config if not
+            #     cred.utilized and target host not infected -> unused_cred goal
+            # dedupe by (kind, target_ip).
+        def is_satisfied(self) -> bool:
+            return len(self.remaining_goals()) == 0
+        def describe_remaining(self) -> str:
+            # compact bullet text injected back to the planner, e.g.:
+            # "You requested to finish, but these objectives are still OPEN:
+            #  - [compromise] 192.168.201.100 reachable from 192.168.200.20 ...
+            #  Continue pursuing them, or justify infeasibility with evidence."
+
+No LLM, no C2, no Docker calls. Reads only env_state_service + attack_graph.
+
+
+--------------------------------------------------------------------------------
+3. FILE: incalmo/core/strategies/llm/llm_strategy.py   (wire the gate)
+--------------------------------------------------------------------------------
+3a. __init__ (after services exist): instantiate conditionally.
+      self.goal_manager = (
+          GoalManager(self.environment_state_service,
+                      self.attack_graph_service, self.config.features)
+          if self.config.features.p1_goal_manager else None
+      )
+      self.finish_rejections = 0
+
+3b. Gate the FINISHED branch. CURRENT (llm_strategy.py:228-229):
+      if llm_action.response_type == LLMResponseType.FINISHED:
+          return True
+    NEW:
+      if llm_action.response_type == LLMResponseType.FINISHED:
+          if self.goal_manager is None:
+              return True                      # baseline behavior (flag off)
+          if self.goal_manager.is_satisfied():
+              return True                      # really done
+          if self.finish_rejections >= self.config.features.p1_max_finish_rejections:
+              self.logger.info("[P1] max finish rejections reached; allowing finish.")
+              return True                      # safety valve (bounded)
+          self.finish_rejections += 1
+          self.last_response = (
+              self.goal_manager.describe_remaining()
+              + "\n(Do not emit <finished> until these are done or proven infeasible.)"
+          )
+          self.logger.info(f"[P1] Rejected <finished> #{self.finish_rejections}: "
+                            f"{len(self.goal_manager.remaining_goals())} goals open.")
+          return False                         # force another planning step
+
+WHY this channel: self.last_response is the EXISTING mechanism by which query/
+action results are fed into the next prompt (the llm_interface builds the next
+turn from pre_prompt + last_response). Injecting the remaining-goals text there
+needs no interface change.
+
+3c. Nothing else changes. When flag is off, goal_manager is None and the branch
+    is byte-for-byte the old `return True`.
+
+
+--------------------------------------------------------------------------------
+4. SAFETY VALVE (avoid infinite rejection loop)
+--------------------------------------------------------------------------------
+If the oracle insists on a target that is actually unreachable (possible while P2
+is OFF, because reachability is global/optimistic), the planner could keep saying
+<finished> and keep being rejected. p1_max_finish_rejections bounds this: after N
+rejections the gate lets the run finish. This is a KNOWN LIMITATION that P2 fixes
+(vantage-aware reachability stops the oracle demanding unreachable targets).
+Recorded as the concrete argument for the P1+P2 combination.
+
+
+--------------------------------------------------------------------------------
+5. MANUAL FIXTURE HARNESS (JSON — user's chosen format)
+--------------------------------------------------------------------------------
+NEW DIR: incalmo/proposal/fixtures/
+  schema (one JSON per scenario), example equifax_midrun.json:
+    {
+      "subnets": ["192.168.200.0/24", "192.168.201.0/24"],
+      "hosts": [
+        {"ip": "192.168.200.20", "hostname": "web", "infected": true,
+         "agents": ["pawWEB"],
+         "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}},
+         "ssh_config": [{"host_ip": "192.168.201.100", "username": "database",
+                         "port": "22", "utilized": false}],
+         "critical_data_files": {}},
+        {"ip": "192.168.201.100", "hostname": "db", "infected": false,
+         "open_ports": {"22": {"service": "ssh", "cve": []}},
+         "critical_data_files": {"root": ["/var/lib/db/dump.sql"]}}
+      ],
+      "exfiltrated": []            # files already taken
+      // optional for P2 later: "reachability": {"pawWEB": ["192.168.201.0/24"]}
+    }
+
+NEW FILE: incalmo/proposal/fixtures/loader.py
+  - load_fixture(path) -> (env_state_service, attack_graph_service)
+  - Builds Network/Subnet/Host/OpenPort/SSHCredential from JSON.
+  - EnvironmentStateService requires a C2ApiClient; pass a STUB
+    (class _StubC2: get_agents()->[], get_agent()->None) so no network/C2 needed.
+  - Returns ready services for GoalManager and tests.
+
+
+--------------------------------------------------------------------------------
+6. TESTS (user wants BOTH pytest + one end-to-end run)
+--------------------------------------------------------------------------------
+NEW FILE: tests/proposal/test_p1_goal_manager.py  (pytest, no LLM/Docker)
+  - test_db_reachable_blocks_finish:
+        load equifax_midrun.json -> GoalManager.is_satisfied() is False;
+        remaining_goals() contains compromise+exfiltrate for 192.168.201.100.
+  - test_all_done_allows_finish:
+        same fixture but db infected + its file in exfiltrated -> is_satisfied True.
+  - test_unused_cred_is_a_goal / test_dedupe.
+  - test_flag_off_is_baseline:
+        with features.p1_goal_manager False, the strategy FINISHED branch returns
+        True immediately (patch/construct minimal strategy or unit the branch).
+  Put a tests/proposal/__init__.py; run with `uv run pytest tests/proposal -q`.
+
+END-TO-END (one real run):
+  - config.json: equifax_large, gemini-2.5-flash, features.p1_goal_manager=true.
+  - docker compose exec attacker 'uv run main.py'.
+  - Compare to baseline output/test_gemini-2.5-flash_2026-10-01_08-05-19/:
+    expect MORE steps toward 192.168.201.100 and/or exfiltration, and that
+    <finished> is rejected at least once ([P1] log line). Save new output dir
+    path + a short before/after note into the decisions log (§7 of main file).
+
+
+--------------------------------------------------------------------------------
+7. DECOUPLING CHECK (satisfies requirement R2)
+--------------------------------------------------------------------------------
+- Flag off  -> goal_manager=None -> original return True. Zero behavior change.
+- Flag on, P2 off -> oracle uses current global reachability (works, bounded by
+  safety valve).
+- Flag on, P2 on  -> oracle automatically uses vantage-aware reachability (more
+  accurate; fewer spurious rejections). No code in GoalManager changes.
+- No import of P4/P5/P6 code. No shared mutable state beyond the read-only
+  services it already receives.
+
+
+--------------------------------------------------------------------------------
+8. FILE CHANGE SUMMARY
+--------------------------------------------------------------------------------
+  EDIT  config/attacker_config.py                 (+Features model, +field)
+  NEW   incalmo/core/services/goal_manager.py      (oracle)
+  EDIT  incalmo/core/strategies/llm/llm_strategy.py (gate at FINISHED branch + init)
+  NEW   incalmo/proposal/fixtures/<scenario>.json  (hand-crafted graphs)
+  NEW   incalmo/proposal/fixtures/loader.py         (JSON -> services, stub C2)
+  NEW   tests/proposal/test_p1_goal_manager.py      (pytest)
+  NEW   tests/proposal/__init__.py
+  (export GoalManager via incalmo/core/services/__init__.py if that module
+   re-exports services — verify before editing.)
+
+Estimated blast radius: additive. Only one existing line of behavior changes
+(the FINISHED branch), and only when the flag is on.

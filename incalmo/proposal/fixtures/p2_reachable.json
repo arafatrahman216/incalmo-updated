@@ -1,0 +1,28 @@
+{
+  "description": "P2: same topology, but a scan from the webserver proved 201/24 REACHABLE (e.g. it has a route/second NIC). Location-aware graph must now offer the attack edge to the DB, and (with P1 on) the DB becomes a legitimate goal.",
+  "subnets": ["192.168.200.0/24", "192.168.201.0/24"],
+  "hosts": [
+    {
+      "ip": "192.168.200.20",
+      "hostname": "web",
+      "infected": true,
+      "privilege": "Elevated",
+      "agents": ["pawWEB"],
+      "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}},
+      "ssh_config": [
+        {"host_ip": "192.168.201.100", "username": "database", "port": "22", "utilized": false}
+      ]
+    },
+    {
+      "ip": "192.168.201.100",
+      "hostname": "db",
+      "infected": false,
+      "open_ports": {"22": {"service": "ssh", "cve": []}},
+      "critical_data_files": {"root": ["/var/lib/db/dump.sql"]}
+    }
+  ],
+  "reachability": {
+    "192.168.200.20": {"192.168.201.0/24": true}
+  },
+  "exfiltrated": []
+}

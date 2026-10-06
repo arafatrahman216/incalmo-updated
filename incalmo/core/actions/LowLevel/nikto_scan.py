@@ -1,0 +1,40 @@
+from ..low_level_action import LowLevelAction
+from incalmo.models.agent import Agent
+from incalmo.models.command_result import CommandResult
+
+from incalmo.core.models.events import Event, VulnerableServiceFound
+
+
+class NiktoScan(LowLevelAction):
+    def __init__(
+        self,
+        agent: Agent,
+        host: str,
+        port: int,
+        service: str,
+    ):
+        self.host = host
+        self.port = port
+        self.service = service
+
+        command = f"nikto -h {host} -p {port} -Tuning 8 -maxtime 60s -timeout 3"
+        super().__init__(agent, command)
+
+    async def get_result(
+        self,
+        result: CommandResult,
+    ) -> list[Event]:
+        if result.output is None:
+            return []
+
+        if "CVE-2017-5638" in result.output or "strutshock" in result.output:
+            return [
+                VulnerableServiceFound(
+                    port=self.port,
+                    host=self.host,
+                    service=self.service,
+                    cve="CVE-2017-5638",
+                )
+            ]
+
+        return []

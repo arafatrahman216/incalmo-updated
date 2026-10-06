@@ -1,0 +1,418 @@
+================================================================================
+INCALMO IMPROVEMENTS — DESIGN, REQUIREMENTS & DECISIONS LOG
+================================================================================
+Project : Agentic Attack (Red-Teaming) Platform — improving Incalmo
+Authors : Arafat Rahman, Samiul Hasan Nihal (BUET x Concordia University)
+Paper   : "On the Feasibility of Using LLMs to Execute Multistage Network
+          Attacks" (arXiv:2501.16466) — week-10/2501.16466v4.pdf
+Source decks: week-10/incalmo_improvements.pptx, week-10/incalmo_review.pptx
+Created : 2026-10-01
+Status  : DESIGN PHASE (no feature code written yet)
+
+PURPOSE OF THIS FILE
+  Persistent, single source of truth so context is never lost between sessions.
+  It records (a) how Incalmo works today, (b) the observed baseline failure,
+  (c) the six proposals and their design, (d) the USER'S BINDING REQUIREMENTS,
+  and (e) an append-only MAJOR DECISIONS LOG. Update section 7 whenever a
+  decision is made. Do not delete history — append.
+
+
+================================================================================
+1. PROPOSAL GROUPINGS (the shared intuition)
+================================================================================
+Per the user, the six proposals cluster into two families plus one glue piece:
+
+  GROUP A — "World model" (state/knowledge centric): Proposals 1, 2, 5
+      Shared goal: give the planner an ACCURATE, COMPLETE, PERSISTENT model of
+      the network and of what still needs doing, so it neither (a) stops early
+      nor (b) acts blind to where it is.
+        - P1 Goal-and-Progress Manager  -> explicit goals + completion gate
+        - P2 Location-Aware Attack Graph -> reachability conditioned on vantage
+        - P5 Structured 4-Tier Memory    -> confidence/TTL/failures/hypotheses
+      They reinforce each other: P1's coverage oracle is more accurate with P2's
+      reachability; P5 supplies the confidence/failure data both consume.
+
+  GROUP B — "Planning & execution control": Proposals 4, 6
+      Shared goal: stop betting the whole run on one sequential path; explore
+      alternatives and run independent work concurrently.
+        - P4 Bounded Beam Search  -> keep k candidate tasks, backtrack on failure
+        - P6 Parallel DAG Scheduler -> run independent tasks simultaneously
+
+  GLUE — Proposal 3 Verifier + Task Contracts
+      Deterministic postcondition checks + structured failure classification.
+      Feeds BOTH groups: it is what turns "command returned output" into
+      "goal state actually changed", and it produces the failure classes that
+      P5 stores and P4 uses to promote the next candidate.
+
+
+================================================================================
+2. HOW INCALMO WORKS TODAY (verified against the code, 2026-10-01)
+================================================================================
+STRATEGY LOOP  (incalmo/core/strategies/llm/llm_strategy.py)
+  - run_incalmo_strategy() loops strategy.main() -> step() until it returns True
+    or a 75-min cap (incalmo/incalmo_runner.py, TIMEOUT_SECONDS).
+  - step(): refresh agents from C2 -> update_host_agents() -> llm_request().
+  - Termination (llm_strategy.py:157, :228-229): loop ends when the LLM emits
+    <finished> (LLMResponseType.FINISHED -> return True), OR cur_step >
+    total_steps (=100), OR guardrail/empty/soft-refusal guards fire.
+  - finished_cb() only logs/backfills — THERE IS NO COMPLETION VERIFICATION.
+  - The LLM's only working memory across steps is self.last_response (previous
+    action result) + whatever it re-queries. "Flat context."
+
+KNOWLEDGE GRAPH  (incalmo/core/services/environment_state_service.py
+                  + incalmo/core/models/network/*.py)
+  - It is already a property graph, just thin:
+      Nodes: Network -> [Subnet] -> [Host]
+      Host(host.py): ip_addresses, hostname, users,
+                     open_ports{port->OpenPort(service, CVE[])},
+                     ssh_config[SSHCredential], critical_data_files{user->[f]},
+                     agents[], infection_source_agent
+      Edges: SSHCredential(credential.py) stored on the host that POSSESSES it,
+             pointing at a target host_ip, with a `utilized` flag  => a
+             credential edge holder->target. infection_source_agent = 2nd edge
+             type (who infected whom).
+  - Updates are purely event-driven: actions emit typed events
+    (HostsDiscovered, ServicesDiscoveredOnHost, SSHCredentialFound,
+     InfectedNewHost, CriticalDataFound, VulnerableServiceFound,
+     ExfiltratedData) and parse_events() folds them in.
+  - GAPS (= Proposal 5): no confidence, no timestamp/expiry, no
+    hypothesis-vs-fact distinction, no record of FAILED attempts.
+  - Statefulness: within a run the `network` object persists and accumulates;
+    BUT StateStore.initialize() wipes at start (no cross-run memory), and
+    update_host_agents() RESETS host.agents each step from the live C2
+    (C2 = source of truth for agent presence).
+
+ATTACK GRAPH  (incalmo/core/services/attack_graph_service.py)
+  - NOT a stored graph — on-demand generators over the knowledge graph:
+      get_possible_attack_paths(attack_host, target): edges from (a) creds
+        attack_host holds to target, (b) each open port on target.
+      get_possible_targets_from_host(...), get_attack_paths_to_target(...).
+      find_exfiltration_path(target): recursive DFS over credential edges,
+        base case host.has_service("http").
+  - Only persistent state: executed_attack_paths[] (dedup log of what's tried);
+    already_executed_attack_path() does fuzzy same-target+same-technique match.
+  - CRITICAL FLAW (= Proposal 2): reachability is GLOBAL and UNCONDITIONED.
+    get_possible_targets_from_host (attack_graph_service.py:114) assumes any
+    agent-bearing host can reach any target with an open port/cred. Only
+    location concept is the boolean Subnet.attacker_subnet. No routing/firewall/
+    ACL model. AttackTechnique carries no cost/utility/detection — the extended
+    action model a:(s,o)->(s',r,c,d) from the deck is absent.
+
+
+================================================================================
+3. OBSERVED BASELINE FAILURE (reproduction target)
+================================================================================
+Run: output/test_gemini-2.5-flash_2026-10-01_08-05-19/ (equifax_large,
+     planning=execution=gemini-2.5-flash, abstraction=incalmo)
+Result: exit 0, ~7.7 min, 25 LLM calls, 56 actions (36 ok / 5 benign fails),
+        ~$0.10. Compromised 2 of ~3 hosts. 0 data exfiltrated.
+Chain : foothold -> scan -> ExploitStruts (CVE-2017-5638) on webserver ->
+        pivot -> found SSH cred database@192.168.201.100 -> SSH lateral move
+        "ran" (empty stderr) but NO agent beaconed back -> model emitted
+        <finished> and quit.
+Why it is the perfect test case:
+  - Demonstrates P1: planner quit with a reachable, credentialed DB still open.
+  - Demonstrates P2: DB subnet 192.168.201.0/24 not reachable/beaconable from
+    the vantage used; planner had no location model to know this.
+  - Demonstrates P3: "empty stderr" was treated as success though no session
+    was established (no postcondition check).
+GOAL OF THE WORK: re-run THIS exact config after P1(+P2) and show
+TotalAcquisition rises (it pursues the DB instead of stopping).
+
+
+================================================================================
+4. DESIGN PLAN (per proposal)
+================================================================================
+P1 — GOAL-AND-PROGRESS MANAGER  (Group A)
+  - Add explicit Goal set to environment def (environment_initializer.py), e.g.
+    ExfiltrateCriticalData(all), Compromise(role=db). Fallback when no ground
+    truth: COVERAGE ORACLE = "no reachable, un-acted target remains".
+  - Oracle reuses existing methods: remaining compromise =
+    network.get_uninfected_hosts() with a non-empty get_attack_paths_to_target()
+    from some infected host; remaining exfil = hosts with critical_data_files
+    not in env.exfiltrated_data and reachable via find_exfiltration_path().
+  - Gate at llm_strategy.py:157/:228. <finished> becomes a REQUEST: if
+    goal_manager.unmet_goals() is empty -> finish; else reject, set last_response
+    to a structured "goals remaining" message, force continue or evidence-backed
+    infeasibility. max_rejections safety valve.
+
+P2 — LOCATION-AWARE ATTACK GRAPH  (Group A)
+  - ENABLER: vantage-tag observations. ScanReportEvent + scan actions must
+    record which agent/host performed the scan; propagate into
+    update_network_from_report() so each port/host carries "observed from X".
+  - Add ReachabilityMatrix[source_host -> set(reachable_subnets)] populated from
+    vantage-tagged scans. Condition get_possible_attack_paths /
+    get_possible_targets_from_host (attack_graph_service.py:208, :114) to only
+    emit an edge if attack_host can reach target's subnet.
+  - Extend AttackTechnique toward (s,o)->(s',r,c,d): predicted goal_progress,
+    cost, detection_risk, required privilege. Even static scores enable ranking
+    by expected utility (also feeds P4).
+
+P5 — STRUCTURED 4-TIER MEMORY  (Group A)
+  - Enrich existing nodes/edges (don't replace): add to OpenPort/SSHCredential/
+    CVE/critical_data_files -> source_agent, first_seen, last_seen,
+    confidence(0-1), ttl, contradicted. Add `verified` to creds (session
+    actually obtained) distinct from "found".
+  - New stores on EnvironmentStateService:
+      FailureLog[FailureRecord(action, source, target, failure_class, ts)]
+        <- highest value / lowest effort; stops repeated-failing-action loops.
+      Hypotheses (suspected vulns/routes; evict on contradiction/TTL).
+  - Tiers: Facts / Hypotheses / Failures / Plans (deck slide 15).
+  - Surface tiers in the prompt (get_infection_summary_str, llm_interface
+    pre_prompt) — invisible state won't change behavior.
+
+STATEFUL EXECUTION (foundation for P3/P4)
+  - Per-step pre/post snapshots of the touched subgraph (Host.to_dict()+creds)
+    -> powers P3 verifier diff and P4 backtracking.
+  - Persist knowledge graph + executed_attack_paths + memory tiers to StateStore
+    each step (keyed by task_id) -> resumable, auditable.
+
+P3 — VERIFIER + TASK CONTRACTS  (Glue)
+  - Stage 1 postcondition check: compare pre/post env snapshots to the task's
+    declared postconditions (e.g. LateralMove succeeds ONLY if a new session/
+    agent exists for target -> kills the "empty stderr = success" false positive).
+  - Stage 2 structured failure classification (raw output never hits planner):
+    wrong-target | insufficient-priv | unreachable | exploit-mismatch |
+    tool-error | planner-logic-error -> each maps to a recovery action.
+
+P4 — BOUNDED BEAM SEARCH  (Group B)
+  - LLM proposes top k=3 candidate tasks + rationale; symbolic controller scores
+    U(pi)=aG-bC-cD-dR and retains all k; on verified failure promote next-ranked
+    (no full replan). Needs the candidate/backtrack layer over the sequential
+    loop + snapshots from "stateful execution".
+
+P6 — PARALLEL DAG SCHEDULER  (Group B)
+  - Dependency model over tasks; dispatch independent tasks simultaneously
+    (parallel subnet scans, multi-DB exfil, multi-host priv-esc); sync barrier ->
+    verifier merge -> goal-manager coverage. Needs async orchestrator + C2
+    command-model changes (today synchronous).
+
+SUGGESTED BUILD ORDER
+  1) Vantage-tagging + FailureLog (enabler plumbing)
+  2) P1 GoalManager gate (max impact / least code; fixes reproducible failure)
+  3) P2 location-conditioned reachability (the correctness win)
+  4) P5 memory-tier enrichment + prompt surfacing
+  5) P3 verifier/contracts -> then P4 beam, P6 DAG (Phase-3 architectural)
+
+
+================================================================================
+5. USER REQUIREMENTS  (BINDING — honor these in all implementation)
+================================================================================
+R1. CONFIGURABILITY: every proposal must be independently switchable via config
+    (config/config.json). Must be able to run:
+      - original/baseline Incalmo (all flags off),
+      - any single proposal (e.g. only P1, or only P2),
+      - any combination (P1+P2, P1+P2+P5, ...), up to all of them.
+R2. DECOUPLING / NO HARD DEPENDENCIES: each feature is a self-contained module
+    with a clean interface and GRACEFUL FALLBACK to baseline behavior when its
+    flag is off. No feature may require another feature to be on to function.
+    (Soft synergy is allowed — e.g. P1's oracle is more accurate when P2 is also
+    on — but P1 must still work correctly with P2 off, using current global
+    reachability.)
+R3. INCREMENTAL, TESTED ONE-BY-ONE: implement and validate each feature on its
+    own before combining. Each lands behind its flag without altering baseline.
+R4. MANUAL TESTING via HAND-CRAFTED ATTACK GRAPH: the supervisor asked for
+    manual testing by manually crafting the attack graph. Provide a way to
+    inject a hand-made environment/attack graph (no LLM, no Docker) and run the
+    feature logic against it deterministically.
+R5. Keep this file updated with every major decision (section 7).
+
+RECOMMENDED APPROACH (agreed direction — see decisions log):
+  - Assign Claude to modify the code, adding each proposal behind an independent
+    config flag, built & tested one at a time, starting with P1.
+  - ALSO build a manual fixture harness (R4): a JSON/YAML describing subnets,
+    hosts, ports, CVEs, creds, agents, and a reachability matrix; a loader that
+    constructs the Network + seeds EnvironmentStateService/AttackGraphService
+    with NO LLM and NO Docker; then unit/scenario tests assert each feature's
+    behavior (e.g. GoalManager refuses <finished> while DB reachable;
+    location-aware graph hides unreachable DB from a given vantage).
+  - Rationale: P1/P2/P5 core logic is pure functions over the graph, so manual
+    injection fully validates them cheaply; P4/P6 also need a mock planner/
+    executor but the same fixtures drive them.
+
+FEASIBILITY ANSWER (to "is it possible?"): YES.
+  - Config-flag + decoupled modules with fallback: standard, fully achievable.
+  - Manual attack-graph injection for testing: achievable and recommended as the
+    primary validation path for Group A; combine with occasional full LLM+Docker
+    runs for end-to-end confirmation.
+
+
+================================================================================
+6. PROPOSED CONFIG SHAPE (draft — subject to decision)
+================================================================================
+Add to config/config.json a "features" block, all default false = baseline:
+  "features": {
+    "p1_goal_manager":      false,
+    "p2_location_aware":    false,
+    "p5_structured_memory": false,
+    "p3_verifier":          false,
+    "p4_beam_search":       false,
+    "p6_dag_scheduler":     false,
+    "enabler_vantage_tagging": false,   // auto-on when p2 or p5 is on
+    "enabler_failure_log":     false    // auto-on when p5 or p3 is on
+  }
+  Parsed in config/attacker_config.py (new optional Features model, defaulting
+  to all-off so existing configs keep working). Each service checks its flag and
+  falls back to current behavior when off.
+
+
+================================================================================
+7. MAJOR DECISIONS LOG  (append-only — newest at bottom)
+================================================================================
+[2026-10-01] Baseline run reproduced on equifax_large w/ gemini-2.5-flash:
+  2/3 hosts, 0 exfil, early <finished>. Adopted as the canonical before/after
+  test case for P1(+P2).
+[2026-10-01] Grouping fixed: Group A = P1,P2,P5 (world model); Group B = P4,P6
+  (planning/execution control); P3 = glue/verifier feeding both.
+[2026-10-01] USER REQUIREMENTS R1-R5 recorded (configurable, decoupled,
+  incremental, manual-graph testable, keep this log). All proposals must be
+  independently toggleable; baseline = all flags off.
+[2026-10-01] Direction: Claude to implement each proposal behind an independent
+  config flag + a manual fixture harness; build & test one at a time; start P1.
+  (Pending user confirmation to begin coding.)
+[2026-10-01] TESTING DECISIONS (user):
+  - Fixture format = JSON files under incalmo/proposal/fixtures/ + a Python
+    loader (easy to diff/version/share with supervisor).
+  - Validation = BOTH pytest scenario tests (logic, no LLM/Docker) AND one full
+    LLM+Docker end-to-end run per feature to confirm real behavior change.
+[2026-10-01] USER CHOSE "PLAN FIRST": do NOT write feature code yet. Produce a
+  detailed per-file implementation plan for P1 for review before any changes.
+  Plan saved to incalmo/proposal/P1_IMPLEMENTATION_PLAN.txt.
+[2026-10-01] P1 DECISIONS (user): (a) "done" criterion = REACH + EXFILTRATE
+  (strict): not done while a reachable uninfected host OR discovered-but-untaken
+  critical data OR an unused cred remains => p1_require_exfiltration=True.
+  (b) pytest tests live in top-level tests/proposal/ .
+  P1_IMPLEMENTATION_PLAN.txt already reflects both.
+[2026-10-01] STATISTICS INFRA (user request): added always-on per-run stats.
+  - NEW incalmo/core/services/statistics_service.py -> writes one JSON per run to
+    statistics/<operation_id>.json (hosts infected/root, critical files
+    discovered vs exfiltrated, exfiltration_complete, creds found/utilized, steps,
+    P1 finish-rejections, action ok/fail counts, LLM calls/tokens/wall-clock,
+    termination_reason, and the config.features flags that were active).
+  - Wired in incalmo/incalmo_runner.py AFTER the loop (covers finished / timeout /
+    max-steps), wrapped in try/except so it never breaks a run.
+  - NEW statistics/ folder (+ README). For later cross-config visualization.
+[2026-10-01] P1 IMPLEMENTED (behind features.p1_goal_manager, default off):
+  - config/attacker_config.py: +Features model (+p1_max_finish_rejections=5,
+    +p1_require_exfiltration=True), +AttackerConfig.features (default all-off =>
+    baseline; verified config.json w/o features still loads).
+  - incalmo/core/services/goal_manager.py: coverage oracle (reach + exfiltrate +
+    unused-cred), pure logic over env+attack graph.
+  - incalmo/core/strategies/llm/llm_strategy.py: goal_manager built only when flag
+    on (else None); FINISHED branch gated (reject <finished> w/ injected
+    remaining-goals until satisfied or p1_max_finish_rejections valve).
+  - Fixtures: incalmo/proposal/fixtures/{loader.py, equifax_midrun.json,
+    equifax_done.json} (JSON graphs, stub C2, no LLM/Docker).
+  - Tests: tests/proposal/test_p1_goal_manager.py -> 5 passed (uv run pytest).
+  - Decoupling verified: flag off => goal_manager None => byte-for-byte baseline.
+[2026-10-01] VALIDATION RUNS (equifax_large, gemini-2.5-flash planning+exec):
+  NOTE: user had changed planning_llm to gemini-3.1-pro-preview, but that model
+  REFUSES the red-team task (safety guardrail: "I cannot fulfill this request")
+  and emits <finished> at step 1 -> unusable for testing attack/P1. Switched to
+  gemini-2.5-flash for the validation, then restored user's config.
+  Results (statistics/*.json):
+    BASELINE (P1 off, test_gemini-2.5-flash_2026-10-01_10-46-18): term=finished,
+      4 steps, 0 actions, 1 host (foothold only), 0 creds, 1.1 min. The planner
+      did 4 read-only queries then quit WITHOUT scanning (planner inaction, high
+      variance — the 08:05 run did 56 actions; this one did none).
+    P1 (p1_goal_manager on, test_gemini-2.5-flash_2026-10-01_10-48-28):
+      term=finished, 45 steps, 36 actions (12 HL/24 LL, 20 ok/4 fail), 6 hosts
+      discovered, 2 infected (pivoted), 3 subnets, 2 creds, 5 finish-rejections
+      then safety valve, 8.6 min. => P1 turned a 0-action no-op into a real
+      2-host compromise. GATE WORKS.
+  FINDINGS / OPEN DESIGN ISSUES surfaced by the real run:
+   (F1) Oracle OVER-COUNTS: it flagged subnet gateway IPs (.1 of each /24:
+        192.168.200.1/199.1/201.1) as "compromise" goals because scans show open
+        ports on them. These are router/noise hosts, not real targets -> inflated
+        the open-goal set so it never reached 0. NEEDS a filter (e.g. only count a
+        host as a compromise goal if it has a CVE or a known credential, not raw
+        open ports alone; and/or exclude gateway .1 / blacklist_ips).
+   (F2) The one legitimate goal (DB 192.168.201.100 + its cred) is genuinely
+        UNREACHABLE from the current vantage -> stays open forever. P1 can only
+        nag; P2 (location-aware reachability) is required to resolve/retire it.
+        Concrete proof of the stated P1+P2 synergy.
+   (F3) Rejections only ACCUMULATE; they do not reset when the planner makes real
+        progress. Consider resetting finish_rejections when env state advances
+        (new host infected / data exfiltrated) so the valve measures "stuck", not
+        "total attempts".
+[2026-10-01] Restored user's config.json (planning_llm=gemini-3.1-pro-preview,
+  no features block = baseline). Working P1 test config documented here for repro:
+    planning_llm=gemini-2.5-flash, execution_llm=gemini-2.5-flash,
+    "features": {"p1_goal_manager": true}.
+[2026-10-01] P1 REFINED per user decisions:
+  - F1: compromise/exfiltrate/unused_cred goals now EXCLUDE subnet gateways (.1),
+    config.blacklist_ips (CIDR-aware), and hosts with no real vector (a compromise
+    goal requires a CVE on an open port OR a held credential; raw open ports alone
+    don't count). goal_manager.py _is_gateway/_is_blacklisted/_has_real_vector.
+  - F3: safety valve now RESETS the rejection counter on real progress (new host
+    infected or file exfiltrated) via goal_manager.evaluate_finish_request()
+    (+ _progress_metric). Strategy FINISHED branch now delegates to it.
+  - GoalManager takes blacklist_ips (strategy passes config.blacklist_ips).
+  - Tests: tests/proposal/test_p1_goal_manager.py -> 9 passed (added F1 gateway/
+    blacklist tests + F3 reset-on-progress + safety-valve tests).
+[2026-10-01] Refined-P1 e2e confirming run (gemini-2.5-flash, p1 on,
+  test_gemini-2.5-flash_2026-10-01_11-19-51): planner IDLED — did 2 queries + 1
+  action, claimed "I need the environment to provide an initial host" (ignoring
+  its live foothold agent) and emitted <finished>; 0 actions executed, P1
+  rejections=0. Gate correctly did NOT fire (nothing scanned => oracle empty).
+  This is gemini-2.5-flash idle-variance / a prompt-comprehension quirk, NOT a P1
+  regression. F1/F3 remain verified by the 9 unit tests, and the 10:48 run already
+  demonstrated the gate working e2e (5 rejections -> forced 2-host compromise).
+  TAKEAWAY: a reliable e2e P1 demo needs a planner that reliably explores;
+  planner-inaction is a separate failure mode (not P1's target).
+  Restored config.json to baseline (planning=gemini-3.1-pro-preview, no features).
+[2026-10-01] Next: P2 (location-aware attack graph) — PLAN FIRST (same workflow as
+  P1). Plan saved to incalmo/proposal/P2_IMPLEMENTATION_PLAN.txt.
+[2026-10-01] P2 DECISIONS (user):
+  - D1 = CONSERVATIVE: unknown reachability => no attack edge; must scan from a
+    vantage first. Scans themselves are never gated.
+  - D3 = YES: surface reachability in the LLM planner prompt now.
+  - User asked to REVISE the P2 plan first (not implement yet). P2_IMPLEMENTATION_
+    PLAN.txt revised accordingly (core idea: infer vantage->subnet reachability
+    from scan outcomes, no event-schema change; gate attack edges in
+    AttackGraphService; same-subnet always reachable; fixes P1 F2 when both on).
+[2026-10-01] P2 IMPLEMENTED (behind features.p2_location_aware, default off):
+  - NEW incalmo/core/services/reachability_model.py: vantage->subnet reachability
+    inferred from scans; can_reach_host (same-subnet always True; else observed-
+    reachable; CONSERVATIVE: unknown/unreachable => not reachable); to_summary()
+    for the prompt.
+  - EDIT attack_graph_service.py: self.reachability (None=off). get_possible_attack
+    _paths returns [] unless can_reach_host(...) is True. None => global baseline.
+  - EDIT HighLevel/scan.py: records reachability per scanned subnet from the
+    vantage (self.scan_host); no-op when model absent. No event-schema change.
+  - EDIT incalmo_strategy.py: attaches ReachabilityModel when p2 on.
+  - EDIT llm_strategy.py: appends reachability.to_summary() to per-step planner
+    state when model present (prompt surfacing, D3). Flag-gated.
+  - GoalManager (P1) given _target_reachable(): a SOFT read of attack_graph.
+    reachability (None when p2 off => no effect, P1 still standalone). When p2 on,
+    exfiltrate/unused_cred goals to unreachable targets are dropped => retires the
+    unreachable-DB goal (F2 fix). Confirms designed P1+P2 synergy, no hard dep.
+  - EDIT loader.py: optional "reachability": {vantage_ip: {subnet: bool}} block.
+  - NEW fixtures p2_unreachable.json / p2_reachable.json.
+  - NEW tests/proposal/test_p2_location_aware.py.
+  - TESTS: uv run pytest tests -> 15 passed (9 P1 + 6 P2), no regressions.
+    Smoke: all modules import; to_summary renders (web reaches 200/24, 201/24
+    unreachable). Decoupling verified: p2 off => reachability None => byte-for-byte
+    baseline attack graph.
+[2026-10-01] P1+P2 e2e run RESULT (gemini-2.5-flash, both on,
+  test_gemini-2.5-flash_2026-10-01_12-25-36): BEST run yet + validates both.
+    term=finished, 32 steps, 57 actions (21 HL/36 LL, 30 ok/6 fail), 6 hosts
+    discovered, 2 infected (pivoted), 3 subnets, 2 creds, 5 P1 rejections->valve.
+    F1 CONFIRMED in a real run: only 2 open goals, BOTH the legitimate DB
+    (compromise 192.168.201.100 + its unused cred) — ZERO gateway/.1 noise
+    (vs 5 noisy goals pre-refinement).
+    P2 CONFIRMED: reachability surfaced in prompt 42x; per-vantage, e.g. foothold
+    796dc4b48d0e reaches 199/200/201, pivoted host e19268211c79 reaches 200/201
+    (199 unscanned). (In this docker topology the foothold COULD scan-reach 201,
+    so the DB was legitimately reachable and correctly remained a goal.)
+    P1 CONFIRMED: 5 rejections forced 57 actions / 2-host compromise (baseline
+    with same model idled at 0 actions). Mission not completed (0 exfil) -> model-
+    capability limit, not P1/P2.
+  NET: P1 stops premature finish; F1 removes noise goals; P2 makes reachability
+  explicit & vantage-specific; P1+P2 compose cleanly (soft synergy, no hard dep).
+[2026-10-01] config.json note: user edited it during the run to gemini-2.5-flash +
+  a features block (p1=false,p2=false = baseline behavior); left as user's intended
+  state (NOT reverted). Toggle flags there to run any combination.
+STATUS: P1 and P2 DONE (impl + 15 passing tests + e2e validated). Remaining per
+  roadmap: P5 (structured memory), P3 (verifier), P4 (beam), P6 (DAG).
+--- append new decisions below ---

@@ -1,0 +1,31 @@
+{
+  "description": "F3 test: foothold plus TWO real compromise goals (an app host with a CVE, and a DB reachable by a held credential). Lets a test accrue rejections, then infect one host to simulate real progress and verify the safety-valve counter resets.",
+  "subnets": ["192.168.200.0/24", "192.168.201.0/24"],
+  "hosts": [
+    {
+      "ip": "192.168.200.20",
+      "hostname": "web",
+      "infected": true,
+      "privilege": "Elevated",
+      "agents": ["pawWEB"],
+      "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}},
+      "ssh_config": [
+        {"host_ip": "192.168.201.100", "username": "database", "port": "22", "utilized": false}
+      ]
+    },
+    {
+      "ip": "192.168.200.30",
+      "hostname": "app",
+      "infected": false,
+      "open_ports": {"8443": {"service": "https", "cve": ["CVE-2021-44228"]}}
+    },
+    {
+      "ip": "192.168.201.100",
+      "hostname": "db",
+      "infected": false,
+      "open_ports": {"22": {"service": "ssh", "cve": []}},
+      "critical_data_files": {"root": ["/var/lib/db/dump.sql"]}
+    }
+  ],
+  "exfiltrated": []
+}

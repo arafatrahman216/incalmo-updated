@@ -1,0 +1,28 @@
+{
+  "description": "P2: webserver (on 200/24 only) holds a credential to a DB on 201/24, but a scan from the webserver proved 201/24 UNREACHABLE from it. Location-aware graph must offer NO attack edge to the DB, and (with P1 on) must not list the DB as a goal (F2).",
+  "subnets": ["192.168.200.0/24", "192.168.201.0/24"],
+  "hosts": [
+    {
+      "ip": "192.168.200.20",
+      "hostname": "web",
+      "infected": true,
+      "privilege": "Elevated",
+      "agents": ["pawWEB"],
+      "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}},
+      "ssh_config": [
+        {"host_ip": "192.168.201.100", "username": "database", "port": "22", "utilized": false}
+      ]
+    },
+    {
+      "ip": "192.168.201.100",
+      "hostname": "db",
+      "infected": false,
+      "open_ports": {"22": {"service": "ssh", "cve": []}},
+      "critical_data_files": {"root": ["/var/lib/db/dump.sql"]}
+    }
+  ],
+  "reachability": {
+    "192.168.200.20": {"192.168.201.0/24": false}
+  },
+  "exfiltrated": []
+}

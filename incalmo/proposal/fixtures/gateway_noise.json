@@ -1,0 +1,27 @@
+{
+  "description": "F1 test: the only uninfected hosts reachable are a subnet gateway (.1) and a host with open ports but no CVE and no credential. Neither is a real attack vector, so a correct oracle has NO open goals here and allows finish.",
+  "subnets": ["192.168.200.0/24"],
+  "hosts": [
+    {
+      "ip": "192.168.200.20",
+      "hostname": "web",
+      "infected": true,
+      "privilege": "Elevated",
+      "agents": ["pawWEB"],
+      "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}}
+    },
+    {
+      "ip": "192.168.200.1",
+      "hostname": "gateway",
+      "infected": false,
+      "open_ports": {"80": {"service": "http", "cve": []}, "22": {"service": "ssh", "cve": []}}
+    },
+    {
+      "ip": "192.168.200.50",
+      "hostname": "bare",
+      "infected": false,
+      "open_ports": {"8080": {"service": "http", "cve": []}}
+    }
+  ],
+  "exfiltrated": []
+}

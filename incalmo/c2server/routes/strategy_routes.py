@@ -1,0 +1,202 @@
+"""
+Strategy-related routes for the C2 server.
+Handles strategy execution, monitoring, and management.
+"""
+
+import json
+import uuid
+from flask import Blueprint, request, jsonify
+
+from config.attacker_config import AttackerConfig
+from incalmo.core.strategies.incalmo_strategy import IncalmoStrategy
+from incalmo.core.strategies.llm.langchain_registry import LangChainRegistry
+from incalmo.c2server.celery.celery_tasks import run_incalmo_strategy_task
+from incalmo.c2server.celery.celery_worker import celery_worker
+from incalmo.c2server.shared import (
+    running_strategy_tasks,
+    TaskState,
+)
+from incalmo.c2server.state_store import StateStore
+
+# Create blueprint
+strategy_bp = Blueprint("strategy", __name__)
+
+
+@strategy_bp.route("/startup", methods=["POST"])
+def incalmo_startup():
+    """Start an Incalmo strategy as a background task."""
+    data = request.get_data()
+    json_data = json.loads(data)
+    # Clear existing environment hosts when starting a new strategy
+    StateStore.set_hosts([])
+
+    # Validate using AttackerConfig schema
+    config = AttackerConfig(**json_data)
+
+    if not config.id:
+        config.id = str(uuid.uuid4())[:8]
+
+    strategy_name = config.name
+
+    if config.id in running_strategy_tasks:
+        return jsonify({"error": "Strategy already running"}), 400
+
+    # Use the imported task function with custom task ID
+    task = run_incalmo_strategy_task.apply_async(
+        args=[config.model_dump()], task_id=config.id
+    )
+    task_id = task.id
+
+    # Store the task ID
+    running_strategy_tasks[task_id] = config
+
+    response = {
+        "status": "success",
+        "message": f"Incalmo strategy {strategy_name} started as background task",
+        "config": config.model_dump(),
+        "task_id": task_id,
+        "strategy": strategy_name,
+    }
+
+    return jsonify(response), 202  # 202 Accepted for async operation
+
+
+@strategy_bp.route("/strategy_status/<strategy_id>", methods=["GET"])
+def strategy_status(strategy_id: str):
+    """Check the status of a running strategy."""
+    if strategy_id not in running_strategy_tasks:
+        return jsonify({"error": "Strategy not found"}), 404
+
+    config = running_strategy_tasks[strategy_id]
+    task = run_incalmo_strategy_task.AsyncResult(strategy_id)
+    task_state = TaskState.from_string(task.state)
+
+    # Safely handle task.info
+    task_info = {}
+    if task.info:
+        try:
+            if isinstance(task.info, dict):
+                task_info = task.info
+            elif isinstance(task.info, Exception):
+                task_info = {"error": str(task.info), "type": type(task.info).__name__}
+            else:
+                task_info = {"info": str(task.info)}
+        except Exception as e:
+            task_info = {"serialization_error": str(e)}
+
+    response = {
+        "strategy": config.name,
+        "task_id": strategy_id,
+        "state": str(task_state),
+        "info": task_info,
+    }
+
+    if task_state == TaskState.PENDING:
+        response["status"] = "Task is waiting to be processed"
+    elif task_state == TaskState.PROGRESS:
+        response["status"] = task_info.get("status", "In progress")
+        response["current"] = task_info.get("current", 0)
+        response["total"] = task_info.get("total", 100)
+    elif task_state == TaskState.SUCCESS:
+        response["status"] = "Task completed successfully"
+        response["result"] = task_info
+    elif task_state == TaskState.FAILURE:
+        response["status"] = "Task failed"
+        response["error"] = task_info.get("error", str(task.info))
+
+    return jsonify(response), 200
+
+
+@strategy_bp.route("/task_status/<task_id>", methods=["GET"])
+def task_status(task_id):
+    """Check the status of a task by its ID."""
+    task = run_incalmo_strategy_task.AsyncResult(task_id)
+    task_state = TaskState.from_string(task.state)
+
+    # Safely handle task.info
+    task_info = {}
+    if task.info:
+        try:
+            if isinstance(task.info, dict):
+                task_info = task.info
+            elif isinstance(task.info, Exception):
+                task_info = {"error": str(task.info), "type": type(task.info).__name__}
+            else:
+                task_info = {"info": str(task.info)}
+        except Exception as e:
+            task_info = {"serialization_error": str(e)}
+
+    response = {"task_id": task_id, "state": str(task_state), "info": task_info}
+
+    if task_state == TaskState.PENDING:
+        response["status"] = "Task is waiting to be processed"
+    elif task_state == TaskState.PROGRESS:
+        response["status"] = task_info.get("status", "In progress")
+    elif task_state == TaskState.SUCCESS:
+        response["status"] = "Task completed successfully"
+        response["result"] = task_info
+    elif task_state == TaskState.FAILURE:
+        response["status"] = "Task failed"
+        response["error"] = task_info.get("error", str(task.info))
+
+    return jsonify(response), 200
+
+
+@strategy_bp.route("/cancel_strategy/<strategy_id>", methods=["POST"])
+def cancel_strategy(strategy_id: str):
+    """Cancel a running strategy."""
+    if strategy_id not in running_strategy_tasks:
+        return jsonify({"error": "Strategy not found"}), 404
+
+    config = running_strategy_tasks[strategy_id]
+    # Revoke the task with terminate=True and signal='SIGKILL'
+    celery_worker.control.revoke(strategy_id, terminate=True, signal="SIGTERM")
+
+    return jsonify(
+        {
+            "message": f"Strategy {config.name} cancelled successfully",
+            "task_id": strategy_id,
+            "status": str(TaskState.REVOKED),
+        }
+    ), 200
+
+
+@strategy_bp.route("/running_strategies", methods=["GET"])
+def list_strategies():
+    """List all currently running strategies."""
+    strategies = {}
+
+    for strategy_id, config in running_strategy_tasks.items():
+        task = run_incalmo_strategy_task.AsyncResult(strategy_id)
+        task_state = TaskState.from_string(task.state)
+
+        strategies[strategy_id] = {
+            "name": config.name,
+            "state": str(task_state),
+        }
+
+    return jsonify(strategies), 200
+
+
+@strategy_bp.route("/available_strategies", methods=["GET"])
+def get_available_strategies():
+    """Get all available strategies from the registry."""
+    strategies = []
+    for strategy_name, strategy_class in IncalmoStrategy._registry.items():
+        if strategy_name not in ["langchain", "llmstrategy"]:
+            strategies.append(
+                {
+                    "name": strategy_name,
+                }
+            )
+        elif strategy_name == "langchain":
+            models = LangChainRegistry().list_models()
+            for model in models:
+                strategies.append(
+                    {
+                        "name": model,
+                    }
+                )
+
+    strategies.sort(key=lambda x: x["name"])
+    return jsonify({"strategies": strategies}), 200

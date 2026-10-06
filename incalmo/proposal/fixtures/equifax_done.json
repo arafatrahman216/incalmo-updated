@@ -1,0 +1,30 @@
+{
+  "description": "Goal-complete Equifax-like state: both web and DB compromised, the DB credential was used, and the DB's critical file has been exfiltrated. A correct Goal Manager must ALLOW <finished> here (no open objectives).",
+  "subnets": ["192.168.200.0/24", "192.168.201.0/24"],
+  "hosts": [
+    {
+      "ip": "192.168.200.20",
+      "hostname": "web",
+      "infected": true,
+      "username": "tomcat",
+      "privilege": "Elevated",
+      "agents": ["pawWEB"],
+      "open_ports": {"8080": {"service": "http", "cve": ["CVE-2017-5638"]}},
+      "ssh_config": [
+        {"host_ip": "192.168.201.100", "username": "database", "port": "22", "utilized": true}
+      ],
+      "critical_data_files": {}
+    },
+    {
+      "ip": "192.168.201.100",
+      "hostname": "db",
+      "infected": true,
+      "username": "root",
+      "privilege": "Elevated",
+      "agents": ["pawDB"],
+      "open_ports": {"22": {"service": "ssh", "cve": []}},
+      "critical_data_files": {"root": ["/var/lib/db/dump.sql"]}
+    }
+  ],
+  "exfiltrated": ["/var/lib/db/dump.sql"]
+}

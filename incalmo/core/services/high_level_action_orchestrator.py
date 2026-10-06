@@ -1,0 +1,61 @@
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from incalmo.core.actions.high_level_action import HighLevelAction
+    from incalmo.core.strategies.llm.interfaces.llm_agent_interface import (
+        LLMAgentInterface,
+    )
+
+from incalmo.core.services import (
+    EnvironmentStateService,
+    AttackGraphService,
+    LowLevelActionOrchestrator,
+)
+
+from incalmo.core.services.logging_service import IncalmoLogger
+from incalmo.core.services.action_context import HighLevelContext
+from incalmo.models.logging_schema import serialize
+from datetime import datetime
+from uuid import uuid4
+
+
+class HighLevelActionOrchestrator:
+    def __init__(
+        self,
+        environment_state_service: EnvironmentStateService,
+        attack_graph_service: AttackGraphService,
+        low_level_action_orchestrator: LowLevelActionOrchestrator,
+        logging_service: IncalmoLogger,
+        llm_interface: Optional["LLMAgentInterface"] = None,
+    ):
+        self.environment_state_service = environment_state_service
+        self.attack_graph_service = attack_graph_service
+        self.low_level_action_orchestrator = low_level_action_orchestrator
+        self.llm_interface = llm_interface
+        self.logger = logging_service.action_logger()
+
+    async def run_action(self, action: "HighLevelAction"):
+        hl_id = str(uuid4())
+        self.last_hl_id = hl_id
+        context = HighLevelContext(hl_id=hl_id, llm_interface=self.llm_interface)
+        ts_start = datetime.now().isoformat()
+        events = await action.run(
+            self.low_level_action_orchestrator,
+            self.environment_state_service,
+            self.attack_graph_service,
+            context,
+        )
+        self.logger.info(
+            "HighLevelAction started execution",
+            type="HighLevelAction",
+            ts_start=ts_start,
+            ts_finish=datetime.now().isoformat(),
+            high_level_action_id=context.hl_id,
+            low_level_action_ids=context.ll_id,
+            action_name=action.__class__.__name__,
+            action_params=serialize(action),
+            events=[serialize(event) for event in events],
+        )
+        await self.environment_state_service.parse_events(events)
+
+        return events

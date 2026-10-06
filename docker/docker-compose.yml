@@ -1,0 +1,75 @@
+networks:
+  attacker_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.199.0/24
+
+  web_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.200.0/24
+
+  db_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.201.0/24
+
+services:
+  attacker:
+    build:
+      context: ../
+      dockerfile: docker/attacker/incalmo.Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      - SERVER_IP=localhost
+      # MODE=docker makes start.sh launch the attacker's own sandcat foothold
+      # agent against the local C2 (http://localhost:8888), giving the strategy
+      # an initial trusted agent. "openstack"/"remote" are for MHBench setups
+      # where the agent is provisioned externally.
+      - MODE=docker
+      - DEBUG=true
+    volumes:
+      - ../:/incalmo
+      - frontend-ignore:/incalmo/incalmo/frontend
+      - venv-volume:/incalmo/.venv
+    networks:
+      attacker_network:
+        ipv4_address: 192.168.199.10
+      web_network:    
+        ipv4_address: 192.168.200.10 
+    ports:
+      - "0.0.0.0:8888:8888"
+      # 6379 (Redis/Celery broker) is only used inside the container; not
+      # published to the host to avoid clashing with a host Redis on 6379.
+      # - "127.0.0.1:6379:6379"
+      # - "127.0.0.1:5678:5678"  # debugpy, not needed for a normal run
+
+  webserver:
+    build:
+      context: ./equifax/webserver
+    container_name: webserver_container
+    restart: always
+    networks:
+      db_network:
+        ipv4_address: 192.168.201.20
+      web_network:
+        ipv4_address: 192.168.200.20
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  db:
+    build:
+      context: ./equifax/database
+    container_name: db_container
+    restart: always
+    networks:
+      db_network:
+        ipv4_address: 192.168.201.100
+
+volumes:
+  venv-volume:
+  frontend-ignore:
