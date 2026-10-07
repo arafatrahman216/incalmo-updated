@@ -10,12 +10,12 @@
 # one config. At the end it prints a per-run table and a per-config averaged table.
 #
 # Requirements: .env at repo root has GOOGLE_API_KEY; docker compose available.
-# Usage:  cd <repo root> && ./scripts/compare_proposals.sh [TRIALS]      (default 3)
+# Usage:  cd <repo root> && ./scripts/compare_proposals.sh [TRIALS]      (default 1)
 #         TRIALS=5 ./scripts/compare_proposals.sh
 set -euo pipefail
 
 # --- config ------------------------------------------------------------------
-TRIALS="${1:-${TRIALS:-3}}"   # number of runs per config
+TRIALS="${1:-${TRIALS:-2}}"   # number of runs per config
 # Pin Gemini temperature for reproducibility (0 = deterministic-ish). Export so the
 # registry inside the container reads it. Override with LLM_TEMPERATURE=... if wanted.
 export LLM_TEMPERATURE="${LLM_TEMPERATURE:-0}"
