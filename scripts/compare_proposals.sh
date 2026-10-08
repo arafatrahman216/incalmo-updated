@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- config ------------------------------------------------------------------
-TRIALS="${1:-${TRIALS:-3}}"   # number of runs per config
+TRIALS="${1:-${TRIALS:-1}}"   # number of runs per config
 # Pin Gemini temperature for reproducibility (0 = deterministic-ish). Export so the
 # registry inside the container reads it. Override with LLM_TEMPERATURE=... if wanted.
 export LLM_TEMPERATURE="${LLM_TEMPERATURE:-0}"

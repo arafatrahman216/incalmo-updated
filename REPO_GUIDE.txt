@@ -1,0 +1,158 @@
+================================================================================
+INCALMO-UPDATED — REPO GUIDE
+================================================================================
+
+1. WHAT THIS REPO IS
+--------------------------------------------------------------------------------
+Incalmo is an academic research tool (arXiv:2501.16466, "On the Feasibility of
+Using LLMs to Execute Multistage Network Attacks") that lets an LLM act as an
+autonomous red-team operator against a simulated multi-host network (an
+"Equifax breach" Docker testbed). It is a C2 (command-and-control) orchestration
+framework: the LLM proposes high-level actions (scan, exploit, pivot,
+exfiltrate), a server translates them into low-level commands run inside
+attacker/target Docker containers, and results feed back into a knowledge graph
+that the LLM sees on the next step.
+
+This fork (incalmo-updated) adds two research extensions on top of baseline
+Incalmo, documented in proposal/PROPOSAL_AND_DECISIONS.txt:
+
+- P1 — Goal-and-Progress Manager: baseline Incalmo would often quit early
+  (emit <finished>) while reachable targets/credentials were still
+  unexploited. P1 adds a coverage oracle that rejects premature <finished>
+  calls until goals (compromise/exfiltrate/use-creds) are satisfied, with a
+  safety valve (p1_max_finish_rejections) so it can't loop forever.
+
+- P2 — Location-Aware Attack Graph: baseline treated reachability as
+  global/unconditioned (any host with an open port = attackable from
+  anywhere). P2 tracks reachability per vantage point (which host can
+  actually reach which subnet, inferred from scan results) and only allows
+  attack-graph edges that are actually reachable from where the attacker
+  currently is.
+
+Both are config-flag toggleable, default OFF (baseline behavior unchanged),
+and decoupled (each works standalone, with soft synergy together) per the
+binding requirements (R1-R5) in the decisions log.
+
+2. WHERE THINGS LIVE (MAP)
+--------------------------------------------------------------------------------
+Entry point
+  main.py
+    Boots ConfigService, resets StateStore, calls run_incalmo_strategy
+
+Config
+  config/config.json (+ config_example.json)
+  config/attacker_config.py
+    Which LLMs, which strategy, feature flags (p1_goal_manager,
+    p2_location_aware, etc.)
+
+Strategy loop
+  incalmo/core/strategies/llm/llm_strategy.py
+    The step loop: refresh agents -> llm_request() -> execute action ->
+    check <finished>
+
+Runner
+  incalmo/incalmo_runner.py
+    Wraps the loop, timeout cap, writes stats at the end
+
+Knowledge graph
+  incalmo/core/services/environment_state_service.py
+  incalmo/core/models/network/*
+    Network -> Subnet -> Host graph; event-driven updates
+
+Attack graph
+  incalmo/core/services/attack_graph_service.py
+    Computes possible attack paths/targets from the knowledge graph
+
+P1 code
+  incalmo/core/services/goal_manager.py
+    Coverage oracle + finish-rejection gate
+
+P2 code
+  incalmo/core/services/reachability_model.py
+    Vantage->subnet reachability tracking, gates attack-graph edges
+
+C2 server
+  incalmo/c2server/
+    Flask/Celery server the attacker container talks to; agents, payloads,
+    routes
+
+Target environment
+  docker/equifax/
+    The simulated vulnerable network (webserver + database containers)
+
+Attacker container
+  docker/attacker/
+    Where Incalmo's agent/runtime actually executes
+
+Stats output
+  statistics/*.json
+  statistics/README.md
+    One JSON per run: progress, execution, LLM usage, termination reason
+
+Logs output
+  output/<operation_id>/
+    Per-run timestamped logs
+
+Test fixtures (no LLM/Docker)
+  incalmo/proposal/fixtures/
+  tests/proposal/
+    Hand-crafted JSON attack graphs to unit-test P1/P2 logic deterministically
+
+Design/decision doc
+  proposal/PROPOSAL_AND_DECISIONS.txt
+    Full history of what was decided and why — read this for "why"
+
+3. HOW TO RUN IT
+--------------------------------------------------------------------------------
+A. Unit tests only (no Docker/LLM — fastest, safe)
+
+  cd /home/nihal/Desktop/AgenticSoc/incalmo-updated
+  uv run pytest tests/proposal -v
+
+  This validates P1/P2 logic against the hand-crafted fixtures in
+  incalmo/proposal/fixtures/ — no network calls, no API cost.
+
+B. Full end-to-end run (Docker + real LLM calls, costs money)
+
+  cp config/config_example.json config/config.json   # edit as needed
+  cp .env.example .env                                 # add your LLM API key(s)
+  cd docker && docker compose up                       # starts attacker + equifax target containers
+  # in a new terminal:
+  cd docker && docker compose exec attacker /bin/bash
+  uv run main.py
+
+  In config/config.json you set planning_llm/execution_llm and the features
+  block, e.g.:
+
+    "features": { "p1_goal_manager": true, "p2_location_aware": true }
+
+  All flags false/absent = original baseline behavior.
+
+C. Optional UI
+  incalmo/frontend/incalmo-ui (npm install && npm start) gives a web view of
+  runs instead of using main.py directly.
+
+4. UNDERSTANDING THE RESULTS
+--------------------------------------------------------------------------------
+After each run (baseline or any flag combo),
+incalmo/core/services/statistics_service.py writes one JSON to
+statistics/<operation_id>.json. Key fields to compare across runs:
+
+- config.features — which flags were on for that run
+- progress: hosts discovered/infected/root, subnets, critical files
+  discovered vs exfiltrated, exfiltration_complete, creds found/utilized
+- execution: steps taken, P1 finish-rejections, action ok/fail counts
+- llm: call count, tokens, wall-clock minutes (cost proxy)
+- termination_reason: finished | timeout | unknown
+
+Practically, to judge "did P1/P2 help": pick matching statistics/*.json files
+with the same model/task (filenames already encode this — baseline_*, p1_*,
+p2_*, both_*, optboth_*, t1/t2/t3 = trial numbers) and compare
+progress.hosts_infected, exfiltration_complete, and execution.steps/actions
+side by side.
+
+The decisions log (proposal/PROPOSAL_AND_DECISIONS.txt, section 7) already
+narrates the key before/after findings from the validation runs — e.g.
+baseline idling at 0 actions vs P1 forcing a real 2-host compromise, and
+P1+P2 together removing false "gateway" goals and correctly retiring
+unreachable targets.
