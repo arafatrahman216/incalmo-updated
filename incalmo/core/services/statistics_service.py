@@ -60,14 +60,20 @@ class StatisticsService:
         taken = discovered_files & exfiltrated_files
         exfiltration_complete = len(discovered_files) > 0 and taken == discovered_files
 
-        # Credentials
-        creds_found = 0
-        creds_utilized = 0
+        # Credentials — count DISTINCT credentials by (username, host_ip), NOT raw
+        # ssh_config entries. The same credential often ends up in several hosts'
+        # ssh_config (e.g. after lateral movement), so the old per-entry count
+        # inflated with wandering and rewarded thrashing over goal-directed runs.
+        seen_found = set()
+        seen_utilized = set()
         for h in network.get_all_hosts():
             for c in h.ssh_config:
-                creds_found += 1
+                key = (getattr(c, "username", None), getattr(c, "host_ip", None))
+                seen_found.add(key)
                 if getattr(c, "utilized", False):
-                    creds_utilized += 1
+                    seen_utilized.add(key)
+        creds_found = len(seen_found)
+        creds_utilized = len(seen_utilized)
 
         # Output-dir derived stats (LLM + actions)
         log_dir = getattr(strategy.logging_service, "logger_dir_path", None)
